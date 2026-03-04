@@ -27,9 +27,9 @@ from roboplan.viser_visualizer import ViserVisualizer
 def main(
     model: str = "ur5",
     task_gain: float = 1.0,
-    lm_damping: float = 2.0,
+    lm_damping: float = 0.01,
+    regularization: float = 1e-6,
     control_freq: float = 100.0,
-    max_joint_velocity: float = 1.0,
     host: str = "localhost",
     port: str = "8000",
 ):
@@ -40,8 +40,9 @@ def main(
         model: The name of the model to use (ur5, franka, or dual).
         task_gain: Task gain (alpha) for the IK solver (0-1).
         lm_damping: Levenberg-Marquardt damping for regularization.
+        regularization: Tikhonov regularization weight for the QP Hessian. Higher values
+            improve numerical stability but may reduce task tracking accuracy.
         control_freq: Control loop frequency in Hz.
-        max_joint_velocity: Maximum joint velocity in rad/s for all joints.
         host: The host for the ViserVisualizer.
         port: The port for the ViserVisualizer.
     """
@@ -105,8 +106,7 @@ def main(
     # Set up the Oink solver with position and velocity limit constraints
     oink = Oink(num_variables)
 
-    # Thread-safe access to tasks and scene
-    tasks_lock = threading.Lock()
+    # Thread-safe access to scene
     scene_lock = threading.Lock()
 
     # Control loop time step
@@ -116,60 +116,50 @@ def main(
     position_limit = PositionLimit(num_variables, gain=1.0)
 
     # Create velocity limit constraint
-    # v_max is in rad/s, the constraint limits delta_q to [-dt*v_max, dt*v_max]
-    v_max = np.full(num_variables, max_joint_velocity)
+    v_max = np.hstack(
+        [scene.getJointInfo(name).limits.max_velocity for name in joint_names]
+    )
     velocity_limit = VelocityLimit(num_variables, dt, v_max)
 
     constraints = [position_limit, velocity_limit]
 
     # Validate starting joint configuration size (should match nq)
-    q_canonical_raw = np.array(model_data.starting_joint_config)
-    if len(q_canonical_raw) != len(q_full):
+    q_canonical = np.array(model_data.starting_joint_config)
+    if len(q_canonical) != len(q_full):
         print(
-            f"\nWarning: starting_joint_config size ({len(q_canonical_raw)}) doesn't match "
+            f"\nWarning: starting_joint_config size ({len(q_canonical)}) doesn't match "
             f"configuration space dimension ({len(q_full)}), using current scene positions instead"
         )
         with scene_lock:
             q_canonical = scene.getCurrentJointPositions()
-    else:
-        q_canonical = q_canonical_raw
     print(
         f"\nUsing starting pose for '{model}' (configuration space size: {len(q_canonical)})"
     )
     print(f"  {q_canonical}")
 
     # Create a ConfigurationTask to regularize toward the starting pose
-    # Joint weights: 0.2 for base joints, 0.1 for all others
-    joint_weights = np.full(num_variables, 0.1)
-    joint_weights[0] = 0.2
-    # For dual-arm, also weight the right arm's base joint symmetrically
-    if model == "dual":
-        joints_per_arm = num_variables // 2  # 9 joints per arm (7 arm + 2 gripper)
-        joint_weights[joints_per_arm] = 0.2
+    joint_weights = np.full(num_variables, 0.05)
     config_options = ConfigurationTaskOptions(task_gain=0.1, lm_damping=0.0)
     config_task = ConfigurationTask(q_canonical, joint_weights, config_options)
 
-    # Task list for the control loop
-    tasks = []
-
     # Task parameters (define before using in callbacks)
     task_options = FrameTaskOptions(
-        position_cost=2.0,
-        orientation_cost=1.0,
+        position_cost=1.0,
+        orientation_cost=0.1,
         task_gain=task_gain,
         lm_damping=lm_damping,
     )
 
-    # Goal configuration
-    goals = []
+    # First, create all frame tasks and controls
+    frame_tasks = []
     transform_controls = []
-
-    # First, create all goals and controls
     for name in model_data.ee_names:
         goal = CartesianConfiguration()
         goal.base_frame = model_data.base_link
         goal.tip_frame = name
-        goals.append(goal)
+
+        frame_task = FrameTask(goal, num_variables, task_options)
+        frame_tasks.append(frame_task)
 
         # Create an interactive marker
         controls = viz.viewer.scene.add_transform_controls(
@@ -183,65 +173,54 @@ def main(
 
     # Now set up the callback after all controls are created
     def update_goals(_):
-        # Thread-safe update of tasks
-        with tasks_lock:
-            tasks.clear()
-            tasks.append(config_task)
-
-            # Set the goal from the marker position
-            for goal, controls in zip(goals, transform_controls):
-                goal.tform = pin.SE3(
-                    pin.Quaternion(controls.wxyz[[1, 2, 3, 0]]), controls.position
-                ).homogeneous
-
-                # Create a FrameTask for this goal
-                frame_task = FrameTask(
-                    goal.tip_frame, goal, num_variables, task_options
-                )
-                tasks.append(frame_task)
+        global paused
+        for idx, controls in enumerate(transform_controls):
+            tform = pin.SE3(
+                pin.Quaternion(controls.wxyz[[1, 2, 3, 0]]), controls.position
+            ).homogeneous
+            tasks[idx].setTargetFrameTransform(tform)
+        paused = False
 
     # Attach the callback to all controls
     for controls in transform_controls:
         controls.on_update(update_goals)
 
+    tasks = frame_tasks + [config_task]
+
     # Control loop
     running = True
+    global paused
+    paused = False
 
     def control_loop():
+        delta_q = np.zeros(num_variables)
         while running:
             loop_start = time.time()
 
-            # Thread-safe task access
-            with tasks_lock:
-                current_tasks = tasks.copy()
-
-            # Only solve if we have tasks
-            if current_tasks:
-                # Thread-safe scene access for IK solving
+            # Thread-safe scene access for IK solving
+            if not paused:
                 with scene_lock:
                     # Get current joint configuration
                     q_current = scene.getCurrentJointPositions()
 
                     # Solve IK for one step with constraints
-                    # Pre-allocate delta_q buffer for in-place modification
-                    delta_q = np.zeros(num_variables)
                     try:
-                        oink.solveIk(current_tasks, constraints, scene, delta_q)
+                        oink.solveIk(tasks, constraints, scene, delta_q, regularization)
                     except RuntimeError as e:
+                        delta_q = np.zeros(num_variables)
                         print(f"Warning: IK solver failed: {e}, using zero delta_q")
 
                     # Integrate: delta_q is a displacement (already limited by VelocityLimit)
                     q_current = scene.integrate(q_current, delta_q)
 
-                    # Update scene state
-                    scene.setJointPositions(q_current)
-
-                    # Update forward kinematics after applying velocities
+                    # Update scene state and forward kinematics after applying velocities
                     # This ensures FK is current for the next iteration's solveIk
-                    for goal in goals:
-                        scene.forwardKinematics(q_current, goal.tip_frame)
+                    scene.setJointPositions(q_current)
+                    for task in tasks:
+                        if isinstance(task, FrameTask):
+                            scene.forwardKinematics(q_current, task.frame_name)
 
-                viz.display(q_current)
+                    viz.display(q_current)
 
             # Maintain control loop rate
             elapsed = time.time() - loop_start
@@ -256,26 +235,26 @@ def main(
 
     @reset_button.on_click
     def reset_position(_):
-        with tasks_lock:
-            tasks.clear()
+        global paused
+        paused = True
         with scene_lock:
             q_current = scene.getCurrentJointPositions()
-            for goal, controls in zip(goals, transform_controls):
-                fk_tform = scene.forwardKinematics(q_current, goal.tip_frame)
+            for idx, controls in enumerate(transform_controls):
+                fk_tform = scene.forwardKinematics(q_current, tasks[idx].frame_name)
                 controls.position = fk_tform[:3, 3]
                 controls.wxyz = pin.Quaternion(fk_tform[:3, :3]).coeffs()[[3, 0, 1, 2]]
+        viz.display(q_current)
 
     random_button = viz.viewer.gui.add_button("Randomize Pose")
 
     @random_button.on_click
     def randomize_position(_):
-        with tasks_lock:
-            tasks.clear()
+        global paused
+        paused = True
         with scene_lock:
             q_rand = scene.randomCollisionFreePositions()
             scene.setJointPositions(q_rand)
         reset_position(_)
-        viz.display(q_rand)
 
     # Display the arm and marker at the starting position
     q_full = q_canonical.copy()

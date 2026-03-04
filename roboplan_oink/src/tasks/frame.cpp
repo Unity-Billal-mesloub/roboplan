@@ -12,68 +12,66 @@ constexpr int kOrientationDimension = 3;
 
 namespace roboplan {
 
+FrameTask::FrameTask(const CartesianConfiguration& target_pose, int num_vars,
+                     const FrameTaskOptions& options)
+    : Task(createWeightMatrix(options.position_cost, options.orientation_cost), options.task_gain,
+           options.lm_damping),
+      frame_name(target_pose.tip_frame), target_pose(target_pose) {
+  // Pre-allocate storage: 6 rows (SE(3) task) × num_vars columns
+  initializeStorage(kSpatialDimension, num_vars);
+}
+
 tl::expected<void, std::string> FrameTask::computeError(const Scene& scene) {
-  // Get the frame ID
-  const auto maybe_frame_id = scene.getFrameId(frame_name);
-  if (!maybe_frame_id) {
-    return tl::make_unexpected("Frame '" + frame_name + "' not found: " + maybe_frame_id.error());
+  // Get the frame ID.
+  if (!frame_id.has_value()) {
+    const auto maybe_frame_id = scene.getFrameId(frame_name);
+    if (!maybe_frame_id) {
+      return tl::make_unexpected("Frame '" + frame_name + "' not found: " + maybe_frame_id.error());
+    }
+    frame_id = maybe_frame_id.value();
   }
-  const auto frame_id = maybe_frame_id.value();
 
   // Get data from scene (assumes kinematics are already up-to-date)
   auto& data = scene.getData();
 
   // Get current frame pose in world frame
-  const pinocchio::SE3& transform_frame_to_world = data.oMf.at(frame_id);
+  const pinocchio::SE3& transform_world_to_frame = data.oMf.at(frame_id.value());
 
   // Get target pose as SE3
-  const pinocchio::SE3 transform_target_to_world(target_pose.tform);
+  const pinocchio::SE3 transform_world_to_target(target_pose.tform);
 
-  // Compute transform from target to frame
-  // T_target_to_frame = T_frame_to_world^{-1} * T_target_to_world
-  const pinocchio::SE3 transform_target_to_frame =
-      transform_frame_to_world.actInv(transform_target_to_world);
-
-  // Compute error as SE3 logarithm and store in error_container
-  // Error is the tangent vector from current frame to target (toward goal)
-  const pinocchio::Motion error_motion = pinocchio::log6(transform_target_to_frame);
-  error_container = error_motion.toVector();
+  // Compute linear and angular errors from target to frame, in the world frame.
+  Eigen::Vector3d e_pos =
+      transform_world_to_target.translation() - transform_world_to_frame.translation();
+  Eigen::Matrix3d R_err =
+      transform_world_to_frame.rotation().transpose() * transform_world_to_target.rotation();
+  Eigen::Vector3d e_rot = transform_world_to_frame.rotation() * pinocchio::log3(R_err);
+  error_container.head<3>() = e_pos;
+  error_container.tail<3>() = e_rot;
 
   return {};
 }
 
 tl::expected<void, std::string> FrameTask::computeJacobian(const Scene& scene) {
-  // Get the frame ID
-  const auto maybe_frame_id = scene.getFrameId(frame_name);
-  if (!maybe_frame_id) {
-    return tl::make_unexpected("Frame '" + frame_name + "' not found: " + maybe_frame_id.error());
+  // Get the frame ID.
+  if (!frame_id.has_value()) {
+    const auto maybe_frame_id = scene.getFrameId(frame_name);
+    if (!maybe_frame_id) {
+      return tl::make_unexpected("Frame '" + frame_name + "' not found: " + maybe_frame_id.error());
+    }
+    frame_id = maybe_frame_id.value();
   }
-  const auto frame_id = maybe_frame_id.value();
 
   // Get current joint configuration
   const Eigen::VectorXd& q = scene.getCurrentJointPositions();
 
-  // Get current frame pose in world frame (assumes kinematics are already up-to-date)
-  const auto& data = scene.getData();
-  const pinocchio::SE3& transform_frame_to_world = data.oMf.at(frame_id);
-
-  // Get target pose as SE3
-  const pinocchio::SE3 transform_target_to_world(target_pose.tform);
-
-  // Compute transform from target to frame
-  const pinocchio::SE3 transform_target_to_frame =
-      transform_frame_to_world.actInv(transform_target_to_world);
-
   // Compute frame Jacobian into jacobian_container
-  scene.computeFrameJacobian(q, frame_id, pinocchio::ReferenceFrame::LOCAL, jacobian_container);
+  scene.computeFrameJacobian(q, frame_id.value(), pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED,
+                             jacobian_container);
 
-  // Compute logarithmic Jacobian
-  pinocchio::Jlog6(transform_target_to_frame, Jlog);
-
-  // Combine: J(q) = -Jlog6 * J_frame (in-place)
   // The negative sign ensures that with the QP formulation (min ||J*dq + gain*e||^2),
   // the solution dq = -gain * J^{-1} * e moves toward the target.
-  jacobian_container.applyOnTheLeft(-Jlog);
+  jacobian_container *= -1.0;
 
   return {};
 }
